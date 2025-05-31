@@ -1,0 +1,347 @@
+---
+output: html_document
+---
+
+```{r include=F, echo=F}
+options(scipen = 999)
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  tidyverse, janitor, glue, ggstatsplot, kableExtra, effectsize,
+  syuzhet
+)
+```
+
+# Load Data
+
+```{r}
+results <- read_csv("data.csv", show_col_types = F)
+results_expanded <- read_csv("results_expanded.csv", show_col_types = F)
+all_books <- read_csv("chronology.csv", show_col_types = F)
+# from https://github.com/robertrouse/theographic-bible-metadata
+books <- read_csv("theographic_books.csv", show_col_types = F)
+chapters <- read_csv("theographic_chapters.csv", show_col_types = F)
+verses <- read_csv("theographic_verses.csv", show_col_types = F)
+```
+
+# Descriptive Results
+
+```{r}
+results %>%
+  mutate(testament = ifelse(chrono_num %in% c(1, 2, 3), "OT", "NT")) %>%
+  count(testament)
+results %>%
+  count(chrono_num)
+results %>%
+  count(deberta.hybrid) %>%
+  adorn_totals() %>%
+  adorn_percentages(denominator = "col")
+all_books %>%
+  group_by(testament) %>%
+  summarize(sumverses = sum(verseCount))
+results %>%
+  mutate(chunk = ifelse(chrono_num %in% 1:3, "Hebrew Bible", "NT")) %>%
+  count(chunk) %>%
+  mutate(pct = n / sum(n))
+```
+
+# Figure 2
+
+```{r}
+(fig2.data <- results %>%
+  mutate(Epoch = glue("{chrono_num}. {chrono_txt}")) %>%
+  mutate(Epoch = str_wrap(Epoch, 20)) %>%
+  mutate(
+    Epoch = factor(Epoch),
+    Epoch = fct_reorder(Epoch, chrono_num)
+  ) %>%
+  mutate(deberta.hybrid = str_to_title(deberta.hybrid)) %>%
+  count(Epoch, deberta.hybrid))
+(fig2 <- ggbarstats(
+  data = fig2.data,
+  x = deberta.hybrid,
+  y = Epoch,
+  counts = n,
+  title = "",
+  type = "parametric",
+  bf.message = F,
+  proportion.test = F,
+  xlab = "Historical Period",
+  legend.title = "Sentiments"
+) +
+  theme(text = element_text(size = 22), legend.position = "top") +
+  scale_fill_viridis_d(option = "cividis", begin = 0.1, end = 0.9))
+```
+
+## Figure 2 - Chi-Square Test
+
+```{r}
+(results.cs <- results %>%
+  mutate(
+    two.periods = factor(ifelse(chrono_num %in% c(1, 2, 3),
+      "Hebrew Bible", "New Testament"
+    )),
+    four.periods = factor(chrono_txt)
+  ) %>%
+  select(deberta.hybrid, two.periods, four.periods))
+(cs.four <- chisq.test(results.cs$deberta.hybrid, results.cs$four.periods))
+(cs.four.ph <- chisq.posthoc.test::chisq.posthoc.test(table(results.cs %>%
+  select(deberta.hybrid, four.periods))))
+cs.four.ph %>%
+  as_tibble() %>%
+  mutate(across(where(is.numeric), ~ ifelse(. <= .05 & Value == "p values",
+    paste0(round(., 2), "*"),
+    round(., 2)
+  ))) %>%
+  kable(digits = 2) %>%
+  kable_styling(latex_options = "striped")
+effectsize::cramers_v(results.cs$deberta.hybrid, results.cs$four.periods,
+  adjust = T
+)
+```
+
+# Figure 3
+
+```{r}
+results.expand <- results %>%
+  left_join(books %>% select(book = bookName, osisName), by = "book") %>%
+  mutate(
+    chapter.true = as.numeric(str_match(osisRef, "^.+\\.(\\d+)\\.(\\d+)$")[, 2]),
+    verse.true = as.numeric(str_match(osisRef, "^.+\\.(\\d+)\\.(\\d+)$")[, 3]),
+    chapter.check = chapter == chapter.true,
+    verse.check = verse == verse.true
+  ) %>%
+  relocate(chapter.true, .after = "chapter") %>%
+  relocate(verse.true, .after = "verse") %>%
+  relocate(chapter.check, .after = "chapter") %>%
+  relocate(verse.check, .after = "verse") %>%
+  mutate(
+    p1_num = verse + 1,
+    m1_num = verse - 1,
+    osisRef.ch = glue("{osisName}.{chapter.true}")
+  ) %>%
+  left_join(chapters %>% select(osisRef.ch = osisRef, verses),
+    by = "osisRef.ch"
+  ) %>%
+  mutate(
+    p1_osisRef = glue("{osisName}.{chapter.true}.{p1_num}"),
+    m1_osisRef = glue("{osisName}.{chapter.true}.{m1_num}"),
+    p1_exists = str_detect(verses, p1_osisRef),
+    m1_exists = str_detect(verses, m1_osisRef),
+    one_missing = !(p1_exists & m1_exists)
+  )
+f3.data.original <- results.expand %>%
+  arrange(chrono_num, bookOrder, chapter.true, verse.true) %>%
+  pull(verseText)
+f3.get.data <- function(mymethod, mydata) {
+  mysents <- get_sentiment(mydata, method = str_to_lower(mymethod))
+  dct <- get_dct_transform(mysents, scale_vals = F, scale_range = T) %>%
+    enframe() %>%
+    mutate(category = mymethod)
+  return(dct)
+}
+f3.get.plot <- function(mydata) {
+  mydata %>%
+    ggplot(aes(
+      x = name, y = value, color = category, linetype = category,
+      linewidth = category
+    )) +
+    geom_line() +
+    theme_classic() +
+    labs(x = "Normalized Biblical\nChronological Time", y = "Scaled Sentiment") +
+    theme(text = element_text(size = 22), legend.position = "right") +
+    scale_linetype_manual(
+      name = "Sentiment Classifier",
+      values = c("dotted", "dashed", "solid", "solid", "dotdash")
+    ) +
+    scale_linewidth_manual(
+      name = "Sentiment Classifier",
+      values = c(1, 1, 2, 1, 1)
+    ) +
+    scale_color_manual(
+      name = "Sentiment Classifier",
+      values = c("gray60", "gray40", "#00326f", "gray50", "gray0")
+    )
+}
+deberta.original <- results.expand %>%
+  arrange(chrono_num, bookOrder, chapter.true, verse.true) %>%
+  mutate(deberta.hybrid = case_when(
+    deberta.hybrid == "negative" ~ -1,
+    deberta.hybrid == "neutral" ~ 0,
+    deberta.hybrid == "positive" ~ 1
+  )) %>%
+  pull(deberta.hybrid) %>%
+  get_dct_transform(scale_vals = F, scale_range = T) %>%
+  enframe() %>%
+  mutate(category = "Human / NLP")
+deberta.expanded <- results_expanded %>%
+  mutate(deberta.hybrid = case_when(
+    deberta.hybrid == "negative" ~ -1,
+    deberta.hybrid == "neutral" ~ 0,
+    deberta.hybrid == "positive" ~ 1
+  )) %>%
+  pull(deberta.hybrid) %>%
+  get_dct_transform(scale_vals = F, scale_range = T) %>%
+  enframe() %>%
+  mutate(category = "Human / NLP")
+arg1 <- c("Syuzhet", "AFINN", "Bing", "NRC")
+(fig3 <- map(arg1, f3.get.data, mydata = f3.data.original) %>% list_rbind() %>%
+  bind_rows(deberta.original) %>%
+  f3.get.plot())
+```
+
+# S1 Figure
+
+```{r}
+(supp.f3.tmp <- results %>%
+  mutate(
+    Epoch = glue("{chrono_num}. {chrono_txt}"),
+    Epoch = factor(Epoch),
+    Epoch = fct_reorder(Epoch, chrono_num)
+  ) %>%
+  mutate(
+    book = factor(book),
+    book = fct_reorder(book, bookOrder)
+  ) %>%
+  select(Epoch, Book = book) %>%
+  group_by(Book) %>%
+  summarize(older_adult_verses = n()))
+(s1.figure <- all_books %>%
+  mutate(
+    Epoch = glue("{chronology}. {chronology2}"),
+    Epoch = factor(Epoch),
+    Epoch = fct_reorder(Epoch, chronology)
+  ) %>%
+  mutate(
+    bookName = factor(bookName),
+    bookName = fct_reorder(bookName, bookOrder),
+    chronology2 = factor(chronology2)
+  ) %>%
+  select(Book = bookName, Epoch) %>%
+  left_join(supp.f3.tmp, by = "Book") %>%
+  ggplot(aes(x = Book, y = older_adult_verses, fill = Epoch)) +
+  geom_col() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(
+    x = "Book in KJV Canonical Order", y = "Number of Verses about Older Adults",
+    fill = "Historical Period",
+    title = ""
+  ) +
+  scale_fill_viridis_d(option = "cividis", begin = 0.1, end = 0.9) +
+  theme(
+    text = element_text(size = 20),
+    legend.position = "top"
+  ))
+```
+
+## S1 Figure - Caption
+
+```{r}
+all_books %>%
+  mutate(
+    Epoch = glue("{chronology}. {chronology2}"),
+    Epoch = factor(Epoch),
+    Epoch = fct_reorder(Epoch, chronology)
+  ) %>%
+  mutate(
+    bookName = factor(bookName),
+    bookName = fct_reorder(bookName, bookOrder),
+    chronology2 = factor(chronology2)
+  ) %>%
+  select(Book = bookName, Epoch) %>%
+  left_join(supp.f3.tmp, by = "Book") %>%
+  mutate(yes_verses = is.na(older_adult_verses)) %>%
+  count(yes_verses) %>%
+  janitor::adorn_totals()
+```
+
+# S2 Figure
+
+```{r}
+(s2figure_data <- results_expanded %>%
+  mutate(chrono_txt = case_when(
+    chrono_num == 1 ~ "Primeval History/Middle Bronze Age",
+    chrono_num == 2 ~ "Late Bronze Age",
+    chrono_num == 3 ~ "Iron Age",
+    chrono_num == 4 ~ "Roman Empire"
+  )) %>%
+  mutate(Epoch = glue("{chrono_num}. {chrono_txt}")) %>%
+  mutate(Epoch = str_wrap(Epoch, 20)) %>%
+  mutate(
+    Epoch = factor(Epoch),
+    Epoch = fct_reorder(Epoch, chrono_num)
+  ) %>%
+  mutate(deberta.hybrid = str_to_title(deberta.hybrid)) %>%
+  count(Epoch, deberta.hybrid))
+(s2.figure <- ggbarstats(
+  data = s2figure_data,
+  x = deberta.hybrid,
+  y = Epoch,
+  counts = n,
+  title = "",
+  type = "parametric",
+  bf.message = F,
+  proportion.test = F,
+  xlab = "Historical Period",
+  legend.title = "Sentiments"
+) +
+  theme(text = element_text(size = 22), legend.position = "top") +
+  scale_fill_viridis_d(option = "cividis", begin = 0.1, end = 0.9)
+)
+```
+
+## S2 Figure - Chi-Square Test
+
+```{r}
+(f2.results.expanded.cs <- results_expanded %>%
+  mutate(four.periods = factor(chrono_num)) %>%
+  select(deberta.hybrid, four.periods))
+(f2.results.expanded.cs.four <- chisq.test(f2.results.expanded.cs$deberta.hybrid, f2.results.expanded.cs$four.periods))
+(f2.results.expanded.cs.ph <- chisq.posthoc.test::chisq.posthoc.test(
+  table(f2.results.expanded.cs %>% select(deberta.hybrid, four.periods))
+))
+f2.results.expanded.cs.ph %>%
+  as_tibble() %>%
+  mutate(across(where(is.numeric), ~ ifelse(. <= .05 & Value == "p values",
+    paste0(round(., 2), "*"), round(., 2)
+  ))) %>%
+  kable(digits = 2) %>%
+  kable_styling(latex_options = "striped")
+effectsize::cramers_v(f2.results.expanded.cs$deberta.hybrid,
+  f2.results.expanded.cs$four.periods,
+  adjust = T
+)
+```
+
+# S3 Figure
+
+```{r}
+(results.p1 <- results.expand %>%
+  filter(p1_exists) %>%
+  select(p1_osisRef, chrono_num, bookOrder, chapter.true, verse.true = p1_num) %>%
+  rename(osisRef = p1_osisRef) %>%
+  left_join(verses %>% select(osisRef, verseText), by = "osisRef") %>%
+  mutate(handcoded.sentiment = NA_character_)
+)
+(results.m1 <- results.expand %>%
+  filter(m1_exists) %>%
+  select(m1_osisRef, chrono_num, bookOrder, chapter.true, verse.true = m1_num) %>%
+  rename(osisRef = m1_osisRef) %>%
+  left_join(verses %>% select(osisRef, verseText), by = "osisRef") %>%
+  mutate(handcoded.sentiment = NA_character_)
+)
+(results.expanded <- results.expand %>%
+  select(
+    osisRef, chrono_num, bookOrder, chapter.true, verse.true, verseText,
+    handcoded.sentiment
+  ) %>%
+  bind_rows(results.p1) %>%
+  bind_rows(results.m1) %>%
+  distinct(osisRef, .keep_all = T))
+f3.data.expanded <- results.expanded %>%
+  arrange(chrono_num, bookOrder, chapter.true, verse.true) %>%
+  pull(verseText)
+(s3.figure <- map(arg1, f3.get.data, mydata = f3.data.expanded) %>% list_rbind() %>%
+  bind_rows(deberta.expanded) %>%
+  f3.get.plot())
+```
